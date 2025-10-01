@@ -2331,10 +2331,12 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 }
 
                 auto moduleInst = inst->getModule()->getModuleInst();
-                if (!m_defaultDebugSource)
-                    m_defaultDebugSource = debugSource;
                 // Only create DebugCompilationUnit for non-included files
                 auto isIncludedFile = as<IRBoolLit>(debugSource->getIsIncludedFile())->getValue();
+                // Set default debug source to the first non-included file (main file)
+                // rather than just the first file encountered (which might be a header)
+                if (!m_defaultDebugSource && !isIncludedFile)
+                    m_defaultDebugSource = debugSource;
                 if (!m_mapIRInstToSpvDebugInst.containsKey(moduleInst) && !isIncludedFile)
                 {
                     IRBuilder builder(inst);
@@ -3974,11 +3976,56 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         auto varType = tryGetPointedToType(&builder, globalInst->getDataType());
         auto debugType = emitDebugType(varType);
 
-        // Use default debug source and line info similar to struct debug type emission
+        // Handle debug location for global variables, with special care for entry point parameters
+        // that may have incorrect debug locations pointing to included files
         auto loc = globalInst->findDecoration<IRDebugLocationDecoration>();
-        IRInst* source = loc ? loc->getSource() : m_defaultDebugSource;
-        IRInst* line = loc ? loc->getLine() : builder.getIntValue(builder.getUIntType(), 0);
-        IRInst* col = loc ? loc->getCol() : line;
+        IRInst* source = nullptr;
+        IRInst* line = nullptr;
+        IRInst* col = nullptr;
+        
+        // First, try to get debug location from entry point parameter decoration if available
+        if (auto entryPointParamDecor = globalInst->findDecoration<IREntryPointParamDecoration>())
+        {
+            auto entryPointFunc = entryPointParamDecor->getEntryPoint();
+            if (auto entryPointLoc = entryPointFunc->findDecoration<IRDebugLocationDecoration>())
+            {
+                source = entryPointLoc->getSource();
+                line = entryPointLoc->getLine();
+                col = entryPointLoc->getCol();
+            }
+        }
+        
+        // If we don't have source from entry point, check if global variable's debug location
+        // points to an included file when we have a non-included default debug source available
+        if (!source && loc && loc->getSource() && m_defaultDebugSource)
+        {
+            auto globalDebugSource = as<IRDebugSource>(loc->getSource());
+            auto defaultDebugSource = as<IRDebugSource>(m_defaultDebugSource);
+            
+            if (globalDebugSource && defaultDebugSource)
+            {
+                auto globalIsIncluded = as<IRBoolLit>(globalDebugSource->getIsIncludedFile());
+                auto defaultIsIncluded = as<IRBoolLit>(defaultDebugSource->getIsIncludedFile());
+                
+                // If global variable points to included file but default source is non-included,
+                // prefer the default source (which should be the main file)
+                if (globalIsIncluded && globalIsIncluded->getValue() && 
+                    defaultIsIncluded && !defaultIsIncluded->getValue())
+                {
+                    source = m_defaultDebugSource;
+                    line = builder.getIntValue(builder.getUIntType(), 0);
+                    col = line;
+                }
+            }
+        }
+        
+        // Fall back to global variable's own debug location or defaults
+        if (!source)
+        {
+            source = loc ? loc->getSource() : m_defaultDebugSource;
+            line = loc ? loc->getLine() : builder.getIntValue(builder.getUIntType(), 0);
+            col = loc ? loc->getCol() : line;
+        }
 
         emitOpDebugGlobalVariable(
             getSection(SpvLogicalSectionID::GlobalVariables),
