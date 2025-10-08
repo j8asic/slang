@@ -2331,10 +2331,12 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 }
 
                 auto moduleInst = inst->getModule()->getModuleInst();
-                if (!m_defaultDebugSource)
-                    m_defaultDebugSource = debugSource;
                 // Only create DebugCompilationUnit for non-included files
                 auto isIncludedFile = as<IRBoolLit>(debugSource->getIsIncludedFile())->getValue();
+                // Set default debug source to the first non-included file (main file)
+                // instead of the first file encountered (which could be a header file)
+                if (!m_defaultDebugSource && !isIncludedFile)
+                    m_defaultDebugSource = debugSource;
                 if (!m_mapIRInstToSpvDebugInst.containsKey(moduleInst) && !isIncludedFile)
                 {
                     IRBuilder builder(inst);
@@ -3983,6 +3985,35 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         IRInst* source = loc ? loc->getSource() : m_defaultDebugSource;
         IRInst* line = loc ? loc->getLine() : builder.getIntValue(builder.getUIntType(), 0);
         IRInst* col = loc ? loc->getCol() : line;
+
+        // For entry point parameters (identified by name patterns), prefer main file source
+        // over included file sources to fix debug information pointing to wrong files  
+        if (name && source && m_defaultDebugSource)
+        {
+            if (auto nameStringLit = as<IRStringLit>(name))
+            {
+                auto nameStr = String(nameStringLit->getStringSlice());
+                if (nameStr.startsWith("input_") || nameStr.startsWith("entryPointParam_"))
+                {
+                    // For entry point parameters, check if current source is from an included file
+                    if (auto debugSource = as<IRDebugSource>(source))
+                    {
+                        if (auto isIncludedFile = debugSource->getIsIncludedFile())
+                        {
+                            if (auto isIncludedLit = as<IRBoolLit>(isIncludedFile))
+                            {
+                                if (isIncludedLit->getValue())
+                                {
+                                    // This is an entry point parameter with debug location from an included file
+                                    // Use the main file source instead
+                                    source = m_defaultDebugSource;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         emitOpDebugGlobalVariable(
             getSection(SpvLogicalSectionID::GlobalVariables),
