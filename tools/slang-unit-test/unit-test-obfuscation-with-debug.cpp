@@ -1,7 +1,10 @@
 // unit-test-obfuscation-with-debug.cpp
 
-// Define this to dump all intermediate files and SPIR-V output to disk
-#define DUMP_FILES 0
+// // Define this to dump SPIR-V output to disk (disabled by default for CI) 
+// #define ENABLE_DUMP_FILES
+
+// // Define this to enable verbose logging (disabled by default for CI)
+// #define ENABLE_LOGGING
 
 #include "slang-com-ptr.h"
 #include "slang.h"
@@ -9,7 +12,15 @@
 
 #include <stdio.h>
 
-#if DUMP_FILES
+#ifdef ENABLE_LOGGING
+#define LOG(fmt, ...)           \
+    printf(fmt, ##__VA_ARGS__); \
+    fflush(stdout);
+#else
+#define LOG(fmt, ...)
+#endif
+
+#ifdef ENABLE_DUMP_FILES
 #define SLANG_DUMP_PATH "slang_dump_spirv_asm_obfuscation_ON"
 #ifdef _WIN32
 #include <direct.h>  // For _mkdir on Windows
@@ -21,9 +32,9 @@
 
 using namespace Slang;
 
-#if DUMP_FILES
+#ifdef ENABLE_DUMP_FILES
 // Utility function to dump a blob to a file
-static void dumpBlobToFile(const char* filepath, ISlangBlob* blob, const char* description = nullptr)
+static void dumpBlobToFile(const char* filepath, ISlangBlob* blob)
 {
     if (!blob || blob->getBufferSize() == 0)
         return;
@@ -33,53 +44,14 @@ static void dumpBlobToFile(const char* filepath, ISlangBlob* blob, const char* d
     {
         fwrite(blob->getBufferPointer(), 1, blob->getBufferSize(), file);
         fclose(file);
-        if (description)
-            printf("%s saved to: %s\n", description, filepath);
-        else
-            printf("File saved to: %s\n", filepath);
+        LOG("File saved to: %s\n", filepath);
     }
     else
     {
-        printf("Warning: Failed to open file for writing: %s\n", filepath);
+        LOG("Warning: Failed to open file for writing: %s\n", filepath);
     }
 }
 #endif // DUMP_FILES
-
-// Helper function to compare two blobs byte-by-byte
-static bool compareBlobsEqual(ISlangBlob* blob1, ISlangBlob* blob2, const char* name1, const char* name2)
-{
-    if (!blob1 || !blob2)
-    {
-        printf("ERROR: One or both blobs are null\n");
-        return false;
-    }
-
-    size_t size1 = blob1->getBufferSize();
-    size_t size2 = blob2->getBufferSize();
-
-    printf("Comparing %s (%zu bytes) with %s (%zu bytes)...\n", name1, size1, name2, size2);
-
-    if (size1 != size2)
-    {
-        printf("  ✗ Size mismatch: %zu vs %zu bytes\n", size1, size2);
-        return false;
-    }
-
-    const uint8_t* data1 = (const uint8_t*)blob1->getBufferPointer();
-    const uint8_t* data2 = (const uint8_t*)blob2->getBufferPointer();
-
-    for (size_t i = 0; i < size1; i++)
-    {
-        if (data1[i] != data2[i])
-        {
-            printf("  ✗ Byte mismatch at offset %zu: 0x%02X vs 0x%02X\n", i, data1[i], data2[i]);
-            return false;
-        }
-    }
-
-    printf("  ✓ Blobs are identical!\n");
-    return true;
-}
 
 // Shared shader sources
 static const char* kMathLibrarySource = R"(
@@ -127,9 +99,11 @@ static const char* kFinalShaderSource = R"(
     import ColorLibrary;
     import InlineShader;
 
+    RWStructuredBuffer<float> outputBuffer;
+
     [shader("compute")]
     [numthreads(1, 1, 1)]
-    float computeMain(uint3 tid : SV_DispatchThreadID)
+    void computeMain(uint3 tid : SV_DispatchThreadID)
     {
         float result = 0.0;
         // Use MathLibrary functions
@@ -144,12 +118,14 @@ static const char* kFinalShaderSource = R"(
         float4 baseColor = makeColor(1.0, 0.5, 0.2, 1.0);
         float4 finalColor = scaleColor(baseColor, scale);
         
-        // Just to use the values (prevent optimization)
+        // Compute result and write to output buffer
         if (transformed.x > 0.0)
         {
             result = finalColor.r;
         }
-        return result;
+        
+        // Write result to output buffer (prevents optimization)
+        outputBuffer[tid.x] = result;
     }
 )";
 
@@ -159,7 +135,7 @@ static SlangResult compileLibraryModules(
     ComPtr<ISlangBlob>& outLib1Blob,
     ComPtr<ISlangBlob>& outLib2Blob)
 {
-    printf("  Compiling libraries...\n");
+    LOG("  Compiling libraries...\n");
 
     // Compile Library 1
     ComPtr<slang::IModule> lib1Module;
@@ -169,7 +145,7 @@ static SlangResult compileLibraryModules(
         return SLANG_FAIL;
 
     SLANG_RETURN_ON_FAIL(lib1Module->serialize(outLib1Blob.writeRef()));
-    printf("    Library 1 serialized: %zu bytes\n", outLib1Blob->getBufferSize());
+    LOG("    Library 1 serialized: %zu bytes\n", outLib1Blob->getBufferSize());
 
     // Compile Library 2
     ComPtr<slang::IModule> lib2Module;
@@ -179,7 +155,7 @@ static SlangResult compileLibraryModules(
         return SLANG_FAIL;
 
     SLANG_RETURN_ON_FAIL(lib2Module->serialize(outLib2Blob.writeRef()));
-    printf("    Library 2 serialized: %zu bytes\n", outLib2Blob->getBufferSize());
+    LOG("    Library 2 serialized: %zu bytes\n", outLib2Blob->getBufferSize());
 
     return SLANG_OK;
 }
@@ -191,7 +167,7 @@ static SlangResult compileFinalShader(
     ISlangBlob* lib2Blob,
     ComPtr<slang::IComponentType>& outLinkedProgram)
 {
-    printf("  Loading modules and compiling final shader...\n");
+    LOG("  Loading modules and compiling final shader...\n");
 
     // Load libraries from IR blobs
     ComPtr<slang::IModule> loadedLib1;
@@ -235,7 +211,7 @@ static SlangResult compileFinalShader(
     // Link program
     SLANG_RETURN_ON_FAIL(compositeProgram->link(outLinkedProgram.writeRef(), nullptr));
 
-    printf("    Final shader compiled and linked successfully\n");
+    LOG("    Final shader compiled and linked successfully\n");
     return SLANG_OK;
 }
 
@@ -324,12 +300,12 @@ static SlangResult verifySeparateDebugOutput(
     // Verify that debug SPIR-V is larger (contains more debug info)
     if (debugSpirv->getBufferSize() <= strippedSpirv->getBufferSize())
     {
-        printf("WARNING: Debug SPIR-V (%zu bytes) is not larger than stripped SPIR-V (%zu bytes)\n",
+        LOG("WARNING: Debug SPIR-V (%zu bytes) is not larger than stripped SPIR-V (%zu bytes)\n",
             debugSpirv->getBufferSize(), strippedSpirv->getBufferSize());
-        printf("This might indicate that debug info was not properly separated.\n");
+        LOG("This might indicate that debug info was not properly separated.\n");
     }
 
-    printf("\n  --- Verification 1: No accidental debug info in stripped SPIR-V ---\n");
+    LOG("\n  --- Verification 1: No accidental debug info in stripped SPIR-V ---\n");
     bool strippedHasDebugInstructions = spirvAsmContainsDebugInstructions(strippedAsm);
     if (strippedHasDebugInstructions)
     {
@@ -339,14 +315,14 @@ static SlangResult verifySeparateDebugOutput(
     }
     else
     {
-        printf("  ✓ PASS: Stripped SPIR-V has no debug instructions\n");
+        LOG("  ✓ PASS: Stripped SPIR-V has no debug instructions\n");
     }
 
-    printf("\n  --- Verification 2: Obfuscation check ---\n");
+    LOG("\n  --- Verification 2: Obfuscation check ---\n");
     int strippedOpNameCount = countOpNameInstructions(strippedAsm);
     int debugOpNameCount = countOpNameInstructions(debugAsm);
-    printf("  OpName count in stripped SPIR-V: %d\n", strippedOpNameCount);
-    printf("  OpName count in debug SPIR-V: %d\n", debugOpNameCount);
+    LOG("  OpName count in stripped SPIR-V: %d\n", strippedOpNameCount);
+    LOG("  OpName count in debug SPIR-V: %d\n", debugOpNameCount);
 
     if (strippedOpNameCount > 0)
     {
@@ -355,20 +331,20 @@ static SlangResult verifySeparateDebugOutput(
     }
     else
     {
-        printf("  ✓ PASS: Stripped SPIR-V has no OpName instructions (fully obfuscated)\n");
+        LOG("  ✓ PASS: Stripped SPIR-V has no OpName instructions (fully obfuscated)\n");
     }
 
     if (debugOpNameCount > 0)
     {
-        printf("  ✓ Debug SPIR-V has %d OpName instructions (preserved for debugging)\n", debugOpNameCount);
+        LOG("  ✓ Debug SPIR-V has %d OpName instructions (preserved for debugging)\n", debugOpNameCount);
     }
 
-    printf("\n  --- Verification 3: DBI matches in both files ---\n");
+    LOG("\n  --- Verification 3: DBI matches in both files ---\n");
     bool strippedHasDBI = findDebugBuildIdentifierInSpirv(strippedAsm, debugBuildIdentifier);
     bool debugHasDBI = findDebugBuildIdentifierInSpirv(debugAsm, debugBuildIdentifier);
 
-    printf("  DBI found in stripped SPIR-V: %s\n", strippedHasDBI ? "YES" : "NO");
-    printf("  DBI found in debug SPIR-V: %s\n", debugHasDBI ? "YES" : "NO");
+    LOG("  DBI found in stripped SPIR-V: %s\n", strippedHasDBI ? "YES" : "NO");
+    LOG("  DBI found in debug SPIR-V: %s\n", debugHasDBI ? "YES" : "NO");
 
     if (!strippedHasDBI)
     {
@@ -382,8 +358,8 @@ static SlangResult verifySeparateDebugOutput(
         return SLANG_FAIL;
     }
 
-    printf("  ✓ PASS: DBI '%s' found in both files\n", debugBuildIdentifier);
-    printf("\n  ✓ All verifications passed!\n");
+    LOG("  ✓ PASS: DBI '%s' found in both files\n", debugBuildIdentifier);
+    LOG("\n  ✓ All verifications passed!\n");
 
     return SLANG_OK;
 }
@@ -400,9 +376,9 @@ static SlangResult verifySeparateDebugOutput(
 //    
 SLANG_UNIT_TEST(obfuscationWithSeparateDebug)
 {
-    printf("========================================\n");
-    printf("Testing Obfuscation with Separate Debug\n");
-    printf("========================================\n\n");
+    LOG("========================================\n");
+    LOG("Testing Obfuscation with Separate Debug\n");
+    LOG("========================================\n\n");
 
     // Create global session
     ComPtr<slang::IGlobalSession> globalSession;
@@ -432,7 +408,7 @@ SLANG_UNIT_TEST(obfuscationWithSeparateDebug)
     // ====================================================================
     // Step 1: Compile slang modules with -g2 + Obfuscation ON
     // ====================================================================
-    printf("=== Step 1: Compile *slang_modules with -g2 + Obfuscation ON ===\n");
+    LOG("=== Step 1: Compile *slang_modules with -g2 + Obfuscation ON ===\n");
 
     // Create session for initial library compilation (separate debug info doesn't matter here)
     slang::SessionDesc sessionDesc1 = {};
@@ -454,7 +430,7 @@ SLANG_UNIT_TEST(obfuscationWithSeparateDebug)
     // ====================================================================
     // Step 2: Generate SPIR-V with separate debug
     // ====================================================================
-    printf("=== Step 2: Compile final spirv with -g2 + Obfuscation ON + separate debug ON ===\n");
+    LOG("=== Step 2: Compile final spirv with -g2 + Obfuscation ON + separate debug ON ===\n");
 
     // Create final session with separate debug enabled
     slang::CompilerOptionEntry optionsWithSepDebug[] = { debugInfoOption, obfuscationOption, separateDebugOption };
@@ -475,7 +451,7 @@ SLANG_UNIT_TEST(obfuscationWithSeparateDebug)
     SlangResult queryResult = linkedProgram1->queryInterface(SLANG_IID_PPV_ARGS(linkedProgram1_v2.writeRef()));
     SLANG_CHECK(queryResult == SLANG_OK);
     SLANG_CHECK(linkedProgram1_v2 != nullptr);
-    printf("  IComponentType2 interface obtained successfully\n");
+    LOG("  IComponentType2 interface obtained successfully\n");
 
     // Get compile result with separate debug
     ComPtr<slang::ICompileResult> compileResult;
@@ -488,7 +464,7 @@ SLANG_UNIT_TEST(obfuscationWithSeparateDebug)
 
     if (compileResultDiagnostics && compileResultDiagnostics->getBufferSize() > 0)
     {
-        printf("  Compile result diagnostics:\n%.*s\n",
+        LOG("  Compile result diagnostics:\n%.*s\n",
             (int)compileResultDiagnostics->getBufferSize(),
             (const char*)compileResultDiagnostics->getBufferPointer());
     }
@@ -502,11 +478,11 @@ SLANG_UNIT_TEST(obfuscationWithSeparateDebug)
     }
     SLANG_CHECK(compileResult != nullptr);
 
-    printf("  ICompileResult obtained successfully\n");
+    LOG("  ICompileResult obtained successfully\n");
 
     // Verify we got exactly 2 items (stripped + debug)
     int itemCount = compileResult->getItemCount();
-    printf("  Item count: %d\n", itemCount);
+    LOG("  Item count: %d\n", itemCount);
     SLANG_CHECK(itemCount == 2);
 
     // Extract the two SPIR-V outputs
@@ -523,18 +499,18 @@ SLANG_UNIT_TEST(obfuscationWithSeparateDebug)
     const char* debugBuildIdentifier = metadata->getDebugBuildIdentifier();
     SLANG_CHECK(debugBuildIdentifier != nullptr);
 
-    printf("  Main SPIR-V (stripped): %zu bytes\n", spirvStripped->getBufferSize());
-    printf("  Debug SPIR-V (full): %zu bytes\n", spirvDebug->getBufferSize());
-    printf("  Debug Build Identifier: %s\n", debugBuildIdentifier);
-    printf("  ✓ Step 2 Complete\n\n");
+    LOG("  Main SPIR-V (stripped): %zu bytes\n", spirvStripped->getBufferSize());
+    LOG("  Debug SPIR-V (full): %zu bytes\n", spirvDebug->getBufferSize());
+    LOG("  Debug Build Identifier: %s\n", debugBuildIdentifier);
+    LOG("  ✓ Step 2 Complete\n\n");
 
     // ====================================================================
     // Step 3: Verification
     // ====================================================================
-    printf("=== Step 3: Verification ===\n");
+    LOG("=== Step 3: Verification ===\n");
     SLANG_CHECK(verifySeparateDebugOutput(spirvStripped, spirvDebug, debugBuildIdentifier) == SLANG_OK);
 
-#if DUMP_FILES
+#ifdef ENABLE_DUMP_FILES
     // Create output directory
     const char* outputDir = SLANG_DUMP_PATH;
 #ifdef _WIN32
@@ -542,13 +518,13 @@ SLANG_UNIT_TEST(obfuscationWithSeparateDebug)
 #else
     mkdir(outputDir, 0755);
 #endif
-    printf("  Output directory: %s\n", outputDir);
+    LOG("  Output directory: %s\n", outputDir);
 
     // Dump artifacts for inspection
-    printf("  Dumping artifacts for inspection...\n");
-    dumpBlobToFile(SLANG_DUMP_PATH "/stripped-asm_obfuscation_ON.spvasm", spirvStripped, "  Main SPIR-V ASM (stripped)");
-    dumpBlobToFile(SLANG_DUMP_PATH "/debug-full-asm_obfuscation_ON.spvasm", spirvDebug, "  Debug SPIR-V ASM (full)");
+    LOG("  Dumping artifacts for inspection...\n");
+    dumpBlobToFile(SLANG_DUMP_PATH "/stripped-asm_obfuscation_ON.spvasm", spirvStripped);
+    dumpBlobToFile(SLANG_DUMP_PATH "/debug-full-asm_obfuscation_ON.spvasm", spirvDebug);
 #endif // DUMP_FILES
 
-    printf("\nTest completed successfully!\n");
+    LOG("\nTest completed successfully!\n");
 }
